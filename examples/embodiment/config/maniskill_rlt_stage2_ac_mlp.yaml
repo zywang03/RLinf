@@ -46,7 +46,10 @@ algorithm:
   # -1 disables dense RLT transition collection. 0 means every env step inside
   # each action chunk; N > 0 means every N env steps. Dense transitions are
   # added to SAC replay in addition to the original chunk-start transitions.
-  rlt_dense_z_stride_env_steps: 0
+  # Keep disabled by default: dense transitions omit policy fields (e.g.
+  # prev_logprobs) and break the flat replay cache schema when mixed with
+  # chunk transitions.
+  rlt_dense_z_stride_env_steps: -1
   # Optional failure-signal gate that opens the Stage2 actor near learned
   # failure-onset RLT embeddings. In train_mode=warmup_once it is trained once
   # from episodes collected during the RLT warmup and then frozen; in
