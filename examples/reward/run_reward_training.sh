@@ -16,6 +16,8 @@ echo "============================================"
 echo "Project root: $PROJECT_ROOT"
 
 CONFIG_NAME="reward_training"
+export WANDB_MODE="${WANDB_MODE:-online}"
+LOGGER_BACKENDS="${LOGGER_BACKENDS:-[\"wandb\"]}"
 
 export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
@@ -26,8 +28,8 @@ MEGA_LOG_FILE="${LOG_DIR}/run_reward_training.log"
 # Build command
 CMD="python examples/reward/train_reward_model.py"
 CMD="$CMD runner.logger.log_path=${LOG_DIR}"
+CMD="$CMD runner.logger.logger_backends=${LOGGER_BACKENDS}"
 
 # Run training with remaining arguments
 echo ${CMD} > ${MEGA_LOG_FILE}
 ${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
-

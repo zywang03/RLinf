@@ -28,6 +28,7 @@ from rlinf.algorithms.rlt import (
     build_rlt_route,
     predict_rlt_actions,
 )
+from rlinf.algorithms.rlt.transition import RLT_OBS_KEYS
 from rlinf.config import SupportedModel
 from rlinf.data.embodied_io_struct import (
     RolloutResult,
@@ -604,6 +605,36 @@ class MultiStepRolloutWorker(Worker):
             ),
         )
 
+    def _append_rlt_dense_features(
+        self,
+        result: dict[str, Any],
+        dense_obs_list: list[dict[str, Any]] | None,
+        dense_offsets: torch.Tensor | None,
+    ) -> None:
+        if self.rlt_feature_model is None or not dense_obs_list:
+            return
+        forward_inputs = result.get("forward_inputs", None)
+        if forward_inputs is None:
+            return
+        dense_features = {key: [] for key in RLT_OBS_KEYS}
+        with torch.no_grad():
+            for dense_obs in dense_obs_list:
+                dense_rlt_obs = self.rlt_feature_model.extract_rlt_obs(dense_obs)
+                for key in RLT_OBS_KEYS:
+                    dense_features[key].append(dense_rlt_obs[key].detach())
+        if not dense_features["z_rl"]:
+            return
+        batch_size = dense_features["z_rl"][0].shape[0]
+        for key, values in dense_features.items():
+            forward_inputs[f"rlt_dense_{key}"] = torch.stack(values, dim=1)
+        dense_offsets = torch.as_tensor(
+            dense_offsets,
+            dtype=torch.long,
+            device=dense_features["z_rl"][0].device,
+        )
+        dense_offsets = dense_offsets.reshape(1, -1).expand(batch_size, -1)
+        forward_inputs["rlt_dense_offsets"] = dense_offsets
+
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
     ) -> torch.Tensor | None:
@@ -669,9 +700,62 @@ class MultiStepRolloutWorker(Worker):
         gc.collect()
         self.torch_platform.empty_cache()
 
+    async def _generate_train_bootstrap_rollout(
+        self,
+        env_output: dict[str, Any],
+        output_channel: Channel,
+        stage_id: int,
+    ) -> None:
+        actions, result = self._predict_rollout_actions(
+            env_output["obs"],
+            final_obs=env_output.get("final_obs", None),
+            rlt_switch_flags=env_output.get("rlt_switch_flags", None),
+            intervene_requested=env_output.get("intervene_flags", None),
+        )
+        self._append_rlt_dense_features(
+            result,
+            env_output.get("rlt_dense_obs_list", None),
+            env_output.get("rlt_dense_offsets", None),
+        )
+
+        if self.enable_opd:
+            # OPD keeps this path separate to retain student action tokens for post-rollout teacher logprobs.
+            rollout_result = self._build_rollout_result(
+                actions,
+                result,
+                final_obs=env_output.get("final_obs", None),
+            )
+        else:
+            rollout_result = RolloutResult(
+                actions=actions,
+                prev_values=(
+                    result["prev_values"] if self.collect_prev_infos else None
+                ),
+                bootstrap_values=self.get_bootstrap_values(
+                    env_output.get("final_obs", None)
+                ),
+                forward_inputs=(
+                    result["forward_inputs"]
+                    if self.rlt_feature_model is not None
+                    else {}
+                ),
+            )
+        self.send_to(
+            group_name=self.cfg.env.group_name,
+            channel=output_channel,
+            data=rollout_result,
+            tag="train_rollout_results",
+            route_key=stage_id,
+            async_op=True,
+            batch_size=self.train_batch_size,
+            split_fn=self._split_rollout_result,
+        )
+
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
+        all_done = False
+        final_env_outputs: dict[int, dict[str, Any]] = {}
         for _ in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
                 env_output = await self.recv_from(
@@ -684,11 +768,20 @@ class MultiStepRolloutWorker(Worker):
                     merge_fn=self._merge_obs_batches,
                     infer_batch_size_fn=self._infer_env_batch_size,
                 ).async_wait()
+                if env_output.get("all_done", False):
+                    final_env_outputs[stage_id] = env_output
+                    all_done = True
+                    break
                 actions, result = self._predict_rollout_actions(
                     env_output["obs"],
                     final_obs=env_output.get("final_obs", None),
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
+                )
+                self._append_rlt_dense_features(
+                    result,
+                    env_output.get("rlt_dense_obs_list", None),
+                    env_output.get("rlt_dense_offsets", None),
                 )
 
                 rollout_result = self._build_rollout_result(
@@ -706,6 +799,18 @@ class MultiStepRolloutWorker(Worker):
                     batch_size=self.train_batch_size,
                     split_fn=self._split_rollout_result,
                 )
+            if all_done:
+                break
+
+        if all_done:
+            for stage_id in range(self.num_pipeline_stages):
+                await self._generate_train_bootstrap_rollout(
+                    final_env_outputs[stage_id],
+                    output_channel,
+                    stage_id,
+                )
+            return
+
         for stage_id in range(self.num_pipeline_stages):
             env_output = await self.recv_from(
                 group_name=self.cfg.env.group_name,
@@ -717,44 +822,10 @@ class MultiStepRolloutWorker(Worker):
                 merge_fn=self._merge_obs_batches,
                 infer_batch_size_fn=self._infer_env_batch_size,
             ).async_wait()
-            actions, result = self._predict_rollout_actions(
-                env_output["obs"],
-                final_obs=env_output.get("final_obs", None),
-                rlt_switch_flags=env_output.get("rlt_switch_flags", None),
-                intervene_requested=env_output.get("intervene_flags", None),
-            )
-
-            if self.enable_opd:
-                # OPD keeps this path separate to retain student action tokens for post-rollout teacher logprobs.
-                rollout_result = self._build_rollout_result(
-                    actions,
-                    result,
-                    final_obs=env_output.get("final_obs", None),
-                )
-            else:
-                rollout_result = RolloutResult(
-                    actions=actions,
-                    prev_values=(
-                        result["prev_values"] if self.collect_prev_infos else None
-                    ),
-                    bootstrap_values=self.get_bootstrap_values(
-                        env_output.get("final_obs", None)
-                    ),
-                    forward_inputs=(
-                        result["forward_inputs"]
-                        if self.rlt_feature_model is not None
-                        else {}
-                    ),
-                )
-            self.send_to(
-                group_name=self.cfg.env.group_name,
-                channel=output_channel,
-                data=rollout_result,
-                tag="train_rollout_results",
-                route_key=stage_id,
-                async_op=True,
-                batch_size=self.train_batch_size,
-                split_fn=self._split_rollout_result,
+            await self._generate_train_bootstrap_rollout(
+                env_output,
+                output_channel,
+                stage_id,
             )
 
     @Worker.timer("rollout/generate")
@@ -817,6 +888,7 @@ class MultiStepRolloutWorker(Worker):
                 desc="Evaluating Rollout Epochs",
                 disable=(self._rank != 0),
             ):
+                all_done = False
                 for _ in range(self.n_eval_chunk_steps):
                     for stage_id in range(self.num_pipeline_stages):
                         env_output = await self.recv_from(
@@ -829,6 +901,9 @@ class MultiStepRolloutWorker(Worker):
                             merge_fn=self._merge_obs_batches,
                             infer_batch_size_fn=self._infer_env_batch_size,
                         ).async_wait()
+                        if env_output.get("all_done", False):
+                            all_done = True
+                            break
                         actions, _ = self._predict_rollout_actions(
                             env_output["obs"],
                             mode="eval",
@@ -847,6 +922,8 @@ class MultiStepRolloutWorker(Worker):
                             async_op=True,
                             batch_size=self.eval_batch_size,
                         )
+                    if all_done:
+                        break
 
             if self.enable_offload:
                 self.offload_model()
@@ -916,6 +993,17 @@ class MultiStepRolloutWorker(Worker):
         intervene_flags_list = [
             obs_batch.get("intervene_flags", None) for obs_batch in obs_batches
         ]
+        all_done_flags = [
+            bool(obs_batch.get("all_done", False)) for obs_batch in obs_batches
+        ]
+        dense_obs_lists = [
+            obs_batch.get("rlt_dense_obs_list", None)
+            for obs_batch in obs_batches
+        ]
+        dense_offsets_list = [
+            obs_batch.get("rlt_dense_offsets", None)
+            for obs_batch in obs_batches
+        ]
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged: dict[str, Any] = {}
@@ -943,15 +1031,56 @@ class MultiStepRolloutWorker(Worker):
             ]
             merged_final_obs = _merge_obs_dicts(final_obs_or_obs)
 
+        merged_dense_obs_list = None
+        if any(dense_obs_list is not None for dense_obs_list in dense_obs_lists):
+            if any(dense_obs_list is None for dense_obs_list in dense_obs_lists):
+                raise ValueError(
+                    "Inconsistent rlt_dense_obs_list: some shards are missing dense obs."
+                )
+            dense_len = len(dense_obs_lists[0])
+            if any(
+                len(dense_obs_list) != dense_len
+                for dense_obs_list in dense_obs_lists
+            ):
+                raise ValueError(
+                    "Inconsistent rlt_dense_obs_list lengths across shards."
+                )
+            merged_dense_obs_list = [
+                _merge_obs_dicts(
+                    [dense_obs_list[idx] for dense_obs_list in dense_obs_lists]
+                )
+                for idx in range(dense_len)
+            ]
+
+        merged_dense_offsets = None
+        if any(offsets is not None for offsets in dense_offsets_list):
+            if any(offsets is None for offsets in dense_offsets_list):
+                raise ValueError(
+                    "Inconsistent rlt_dense_offsets: some shards are missing offsets."
+                )
+            first_offsets = torch.as_tensor(dense_offsets_list[0], dtype=torch.long)
+            for offsets in dense_offsets_list[1:]:
+                if not torch.equal(
+                    first_offsets,
+                    torch.as_tensor(offsets, dtype=torch.long),
+                ):
+                    raise ValueError(
+                        "Inconsistent rlt_dense_offsets across shards."
+                    )
+            merged_dense_offsets = first_offsets
+
         return {
             "obs": merged_obs,
             "final_obs": merged_final_obs,
+            "all_done": all(all_done_flags) if all_done_flags else False,
             "rlt_switch_flags": self._merge_optional_flag_tensors(
                 obs_dicts, rlt_switch_flags_list
             ),
             "intervene_flags": self._merge_optional_flag_tensors(
                 obs_dicts, intervene_flags_list
             ),
+            "rlt_dense_obs_list": merged_dense_obs_list,
+            "rlt_dense_offsets": merged_dense_offsets,
         }
 
     def _split_rollout_result(

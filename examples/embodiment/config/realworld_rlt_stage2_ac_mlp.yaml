@@ -9,8 +9,6 @@ hydra:
   run:
     dir: .
   output_subdir: null
-  searchpath:
-    - file://${oc.env:EMBODIED_PATH}/config/
 
 cluster:
   num_nodes: 2
@@ -62,6 +60,36 @@ runner:
 algorithm:
   update_epoch: 8
   group_size: 1
+  # Optional failure-signal gate that opens the Stage2 actor near learned
+  # failure-onset RLT embeddings. In train_mode=warmup_once it is trained once
+  # from episodes collected during the RLT warmup and then frozen; in
+  # train_mode=online it retrains on every newly completed failed episode.
+  rlt_failure_signal:
+    enable: True
+    # online: retrain on every new failed episode (legacy behavior).
+    # warmup_once: collect episodes during warmup, train once when the RLT
+    # warmup finishes, then freeze the detector for zero-shot use.
+    train_mode: warmup_once
+    hidden_dim: 128
+    max_centers: 256
+    score_threshold: 0.7
+    distance_threshold: 6.0
+    pre_window: 2
+    post_window: 1
+    min_failure_episodes: 1
+    min_success_episodes: 0
+    max_episodes: 512
+    # warmup_once only: cap episodes kept from warmup (0 = keep all).
+    max_warmup_episodes: 0
+    lr: 3.0e-3
+    min_steps: 50
+    max_steps: 500
+    patience: 25
+    tolerance: 1.0e-4
+    intra_weight: 1.0
+    smoothness_weight: 1.0e-3
+    margin: 1.0
+    success_reward_threshold: 0.0
   agg_q: min
   actor_agg_q: q1
   enable_drq: False
@@ -84,6 +112,7 @@ algorithm:
 
   # Entropy/alpha is kept at zero; this is not standard maximum-entropy SAC.
   entropy_tuning:
+    enable: False
     alpha_type: fixed_alpha
     initial_alpha: 0.0
     optim:
@@ -173,6 +202,21 @@ rollout:
     action_dim: ${actor.model.action_dim}
     num_action_chunks: ${actor.model.num_action_chunks}
     ref_num_action_chunks: ${actor.model.ref_num_action_chunks}
+    q_head_type: ${actor.model.q_head_type}
+    q_head_hidden_dim: ${actor.model.q_head_hidden_dim}
+    q_head_num_blocks: ${actor.model.q_head_num_blocks}
+    actor_std_type: ${actor.model.actor_std_type}
+    use_tanh_logprob_correction: ${actor.model.use_tanh_logprob_correction}
+    residual_actor: ${actor.model.residual_actor}
+    residual_scale: ${actor.model.residual_scale}
+    failure_signal:
+      enable: ${algorithm.rlt_failure_signal.enable}
+      hidden_dim: ${algorithm.rlt_failure_signal.hidden_dim}
+      max_centers: ${algorithm.rlt_failure_signal.max_centers}
+      score_threshold: ${algorithm.rlt_failure_signal.score_threshold}
+      distance_threshold: ${algorithm.rlt_failure_signal.distance_threshold}
+      pre_window: ${algorithm.rlt_failure_signal.pre_window}
+      post_window: ${algorithm.rlt_failure_signal.post_window}
 
   # Frozen Stage1 pi0.5 + RLT token transformer.
   # This is the actual Stage1 model path. Rollout uses it to convert raw env
@@ -186,6 +230,9 @@ rollout:
     openpi_data:
       # Must match the repo_id/config_name used to compute Stage1 OpenPI norm stats.
       repo_id: "realworld_peg_insertion_rlt_stage1"
+      # Stage1 checkpoints may not package norm_stats.json; point this to the
+      # training dataset stats when loading the frozen feature model.
+      norm_stats_path: null
     openpi:
       config_name: "pi05_franka_state"
       num_images_in_input: 1
@@ -222,8 +269,24 @@ actor:
     precision: fp32
     add_value_head: False
     add_q_head: True
+    # RLToken uses a LayerNorm residual critic by default.
     q_head_type: "default"
+    q_head_hidden_dim: 512
+    q_head_num_blocks: 2
     fixed_std: 0.002
+    actor_std_type: "fixed"
+    use_tanh_logprob_correction: False
+    # When enabled, the actor predicts a zero-initialized delta added to the Stage1 reference chunk.
+    residual_actor: False
+    residual_scale: 1.0
+    failure_signal:
+      enable: ${algorithm.rlt_failure_signal.enable}
+      hidden_dim: ${algorithm.rlt_failure_signal.hidden_dim}
+      max_centers: ${algorithm.rlt_failure_signal.max_centers}
+      score_threshold: ${algorithm.rlt_failure_signal.score_threshold}
+      distance_threshold: ${algorithm.rlt_failure_signal.distance_threshold}
+      pre_window: ${algorithm.rlt_failure_signal.pre_window}
+      post_window: ${algorithm.rlt_failure_signal.post_window}
     is_lora: False
 
     # RLT Stage2 MLP input/output shape.

@@ -18,6 +18,8 @@ export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 export AV_LOG_FORCE_NOCOLOR=1
 export LIBAV_LOG_LEVEL=quiet
 export OPENCV_LOG_LEVEL=off
+export WANDB_MODE="${WANDB_MODE:-online}"
+LOGGER_BACKENDS="${LOGGER_BACKENDS:-[\"wandb\"]}"
 
 export PYTHONPATH="${REPO_PATH}:${LIBERO_REPO_PATH}:$PYTHONPATH"
 
@@ -37,6 +39,6 @@ LOG_DIR="${REPO_PATH}/logs/cfg_rl/${CONFIG_NAME}-$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/run_cfg_rl.log"
 mkdir -p "${LOG_DIR}"
 
-CMD="python ${SRC_FILE} --config-path ${OFFLINE_RL_CONFIG} --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR} $@"
+CMD="python ${SRC_FILE} --config-path ${OFFLINE_RL_CONFIG} --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR} runner.logger.logger_backends=${LOGGER_BACKENDS} $@"
 echo "${CMD}" > "${MEGA_LOG_FILE}"
 ${CMD} 2>&1 | grep --line-buffered -v "libdav1d" | tee -a "${MEGA_LOG_FILE}"

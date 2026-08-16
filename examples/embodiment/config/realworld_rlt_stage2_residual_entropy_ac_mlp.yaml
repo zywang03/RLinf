@@ -1,0 +1,20 @@
+defaults:
+  - realworld_rlt_stage2_residual_ac_mlp
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "realworld_rlt_stage2_residual_entropy_ac_mlp"
+
+algorithm:
+  backup_entropy: True
+  entropy_tuning:
+    enable: True
+    alpha_type: softplus
+    initial_alpha: 0.01
+    target_entropy: -70
+
+actor:
+  model:
+    actor_std_type: "learned"
+    use_tanh_logprob_correction: True

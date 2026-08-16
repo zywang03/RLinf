@@ -43,6 +43,26 @@ algorithm:
     warmup_post_collect_updates: 2
     train_every_episodes: 0
     train_every_transitions: 1
+  rlt_failure_signal:
+    enable: False
+    hidden_dim: 128
+    max_centers: 256
+    score_threshold: 0.7
+    distance_threshold: 6.0
+    pre_window: 2
+    post_window: 1
+    min_failure_episodes: 1
+    min_success_episodes: 0
+    max_episodes: 512
+    lr: 3.0e-3
+    min_steps: 10
+    max_steps: 50
+    patience: 5
+    tolerance: 1.0e-4
+    intra_weight: 1.0
+    smoothness_weight: 1.0e-3
+    margin: 1.0
+    success_reward_threshold: 0.0
   group_size: 1
 
   adv_type: embodied_sac
@@ -64,6 +84,7 @@ algorithm:
     enable: False
 
   entropy_tuning:
+    enable: False
     alpha_type: fixed_alpha
     initial_alpha: 0.0
     optim:
@@ -138,7 +159,21 @@ rollout:
     proprio_dim: ${actor.model.proprio_dim}
     add_q_head: ${actor.model.add_q_head}
     q_head_type: ${actor.model.q_head_type}
+    q_head_hidden_dim: ${actor.model.q_head_hidden_dim}
+    q_head_num_blocks: ${actor.model.q_head_num_blocks}
     fixed_std: ${actor.model.fixed_std}
+    actor_std_type: ${actor.model.actor_std_type}
+    use_tanh_logprob_correction: ${actor.model.use_tanh_logprob_correction}
+    residual_actor: ${actor.model.residual_actor}
+    residual_scale: ${actor.model.residual_scale}
+    failure_signal:
+      enable: ${algorithm.rlt_failure_signal.enable}
+      hidden_dim: ${algorithm.rlt_failure_signal.hidden_dim}
+      max_centers: ${algorithm.rlt_failure_signal.max_centers}
+      score_threshold: ${algorithm.rlt_failure_signal.score_threshold}
+      distance_threshold: ${algorithm.rlt_failure_signal.distance_threshold}
+      pre_window: ${algorithm.rlt_failure_signal.pre_window}
+      post_window: ${algorithm.rlt_failure_signal.post_window}
     is_lora: False
     lora_rank: 32
 
@@ -202,7 +237,21 @@ actor:
     add_value_head: False
     add_q_head: True
     q_head_type: "default"
+    q_head_hidden_dim: 512
+    q_head_num_blocks: 2
     fixed_std: 0.002
+    actor_std_type: "fixed"
+    use_tanh_logprob_correction: False
+    residual_actor: False
+    residual_scale: 1.0
+    failure_signal:
+      enable: ${algorithm.rlt_failure_signal.enable}
+      hidden_dim: ${algorithm.rlt_failure_signal.hidden_dim}
+      max_centers: ${algorithm.rlt_failure_signal.max_centers}
+      score_threshold: ${algorithm.rlt_failure_signal.score_threshold}
+      distance_threshold: ${algorithm.rlt_failure_signal.distance_threshold}
+      pre_window: ${algorithm.rlt_failure_signal.pre_window}
+      post_window: ${algorithm.rlt_failure_signal.post_window}
     is_lora: False
     lora_rank: 32
 

@@ -276,11 +276,19 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
         policies.append(value_head_policy)
 
     if hasattr(module, "q_head"):
-        from rlinf.models.embodiment.modules.q_head import MultiCrossQHead, MultiQHead
+        from rlinf.models.embodiment.modules.q_head import (
+            MultiCrossQHead,
+            MultiLayerNormQHead,
+            MultiQHead,
+        )
 
         if isinstance(module.q_head, MultiCrossQHead):
             q_head_policy = functools.partial(
                 _module_wrap_policy, module_classes={MultiCrossQHead}
+            )
+        elif isinstance(module.q_head, MultiLayerNormQHead):
+            q_head_policy = functools.partial(
+                _module_wrap_policy, module_classes={MultiLayerNormQHead}
             )
         else:
             q_head_policy = functools.partial(

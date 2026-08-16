@@ -13,6 +13,12 @@
 # limitations under the License.
 
 from rlinf.algorithms.expert import build_expert_model_config
+from rlinf.algorithms.rlt.failure_signal import (
+    RLTFailureSignal,
+    RLTFailureSignalEpisode,
+    RLTFailureSignalTrainer,
+    hide_and_seek_loss,
+)
 from rlinf.algorithms.rlt.rollout import predict_rlt_actions
 from rlinf.algorithms.rlt.route import (
     RealworldRLTRoute,
@@ -27,9 +33,13 @@ __all__ = [
     "RLTRoute",
     "RLTRouteContext",
     "RealworldRLTRoute",
+    "RLTFailureSignal",
+    "RLTFailureSignalEpisode",
+    "RLTFailureSignalTrainer",
     "SimulatorRLTRoute",
     "build_expert_model_config",
     "build_rlt_route",
+    "hide_and_seek_loss",
     "predict_rlt_actions",
     "use_simulator_transition_replay",
 ]

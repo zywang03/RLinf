@@ -920,15 +920,88 @@ class EnvWorker(Worker):
 
         return env_outputs
 
-    def _build_rollout_input_data(self, env_batch: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _env_all_done(env: Any) -> bool:
+        all_done = getattr(env, "all_done", None)
+        return bool(all_done) if all_done is not None else False
+
+    def _build_rollout_input_data(
+        self,
+        env_batch: dict[str, Any],
+        *,
+        all_done: bool = False,
+    ) -> dict[str, Any]:
         data = {
             "obs": env_batch["obs"],
             "final_obs": env_batch["final_obs"],
+            "all_done": bool(all_done),
         }
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
             data["intervene_flags"] = env_batch.get("intervene_flags", None)
+            dense_obs_list = env_batch.get("rlt_dense_obs_list", None)
+            if dense_obs_list is not None:
+                data["rlt_dense_obs_list"] = dense_obs_list
+                data["rlt_dense_offsets"] = env_batch.get(
+                    "rlt_dense_offsets", None
+                )
         return data
+
+    def _rlt_dense_offsets(
+        self, obs_list: Any
+    ) -> torch.Tensor | None:
+        if not self.enable_rlt:
+            return None
+        stride = int(self.cfg.algorithm.get("rlt_dense_z_stride_env_steps", -1))
+        if (
+            stride < 0
+            or not isinstance(obs_list, (list, tuple))
+            or len(obs_list) == 0
+        ):
+            return None
+        chunk_size = len(obs_list)
+        if stride == 0:
+            offsets = list(range(1, chunk_size + 1))
+        else:
+            offsets = list(range(stride, chunk_size + 1, stride))
+        if not offsets:
+            return None
+        return torch.tensor(offsets, dtype=torch.long)
+
+    def _append_rlt_dense_obs(
+        self,
+        env_batch: dict[str, Any],
+        obs_list: Any,
+    ) -> None:
+        offsets = self._rlt_dense_offsets(obs_list)
+        if offsets is None:
+            return
+        dense_obs_list = []
+        for offset in offsets.tolist():
+            dense_obs_list.append(
+                EnvOutput(obs=obs_list[offset - 1]).to_dict()["obs"]
+            )
+        env_batch["rlt_dense_obs_list"] = dense_obs_list
+        env_batch["rlt_dense_offsets"] = offsets
+
+    def _move_rlt_dense_features_to_previous_step(
+        self,
+        stage_id: int,
+        rollout_result: RolloutResult,
+    ) -> None:
+        forward_inputs = getattr(rollout_result, "forward_inputs", None)
+        if not isinstance(forward_inputs, dict):
+            return
+        dense_keys = [key for key in forward_inputs if key.startswith("rlt_dense_")]
+        if not dense_keys:
+            return
+        stage_rollout = self.rollout_results[stage_id]
+        target_steps = getattr(stage_rollout, "forward_inputs", None)
+        if not target_steps:
+            return
+        previous_forward_inputs = target_steps[-1]
+        for key in dense_keys:
+            previous_forward_inputs[key] = forward_inputs.pop(key)
 
     def _send_train_bootstrap(
         self, rollout_channel: Channel, env_outputs: list[EnvOutput]
@@ -1032,6 +1105,12 @@ class EnvWorker(Worker):
             else:
                 env_outputs = self._bootstrap_and_send_train(rollout_channel)
 
+            stage_all_done = [False] * self.stage_num
+            stage_last_env_info: list[dict[str, Any] | None] = [
+                None
+            ] * self.stage_num
+            early_stop = False
+
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
                     if cooperative_yield:
@@ -1067,6 +1146,10 @@ class EnvWorker(Worker):
                         merge_fn=RolloutResult.merge_rollout_results,
                         infer_batch_size_fn=self._infer_rollout_batch_size,
                         decoupled_mode=self.env_decoupled_mode,
+                    )
+                    self._move_rlt_dense_features_to_previous_step(
+                        stage_id,
+                        rollout_result,
                     )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
@@ -1116,6 +1199,7 @@ class EnvWorker(Worker):
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )
+                    stage_last_env_info[stage_id] = env_info
                     stage_rollout = self.rollout_results[stage_id]
                     if isinstance(stage_rollout, EmbodiedLerobotRolloutResult):
                         stage_rollout.append_chunk_episode_data(
@@ -1123,10 +1207,24 @@ class EnvWorker(Worker):
                             **chunk_step_payload,
                         )
                     env_batch = env_output.to_dict()
+                    self._append_rlt_dense_obs(
+                        env_batch,
+                        chunk_step_payload.get("obs_list", None),
+                    )
+                    stage_all_done[stage_id] = (
+                        not self.use_training_pipeline
+                        and not self.env_decoupled_mode
+                        and self.stage_num == 1
+                        and self._env_all_done(self.env_list[stage_id])
+                    )
+                    rollout_all_done = all(stage_all_done)
                     self.send_to(
                         group_name=self.cfg.rollout.group_name,
                         channel=rollout_channel,
-                        data=self._build_rollout_input_data(env_batch),
+                        data=self._build_rollout_input_data(
+                            env_batch,
+                            all_done=rollout_all_done,
+                        ),
                         mode="train",
                         tag="rollout_results",
                         route_key=stage_id if not self.env_decoupled_mode else None,
@@ -1150,6 +1248,17 @@ class EnvWorker(Worker):
                     )
                     if should_record:
                         self.record_env_metrics(env_metrics, env_info)
+                    if rollout_all_done:
+                        if not should_record:
+                            for stage_id in range(self.stage_num):
+                                last_info = stage_last_env_info[stage_id]
+                                if last_info:
+                                    self.record_env_metrics(env_metrics, last_info)
+                        early_stop = True
+                        break
+
+                if early_stop:
+                    break
 
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
@@ -1182,6 +1291,10 @@ class EnvWorker(Worker):
                     merge_fn=RolloutResult.merge_rollout_results,
                     infer_batch_size_fn=self._infer_rollout_batch_size,
                     decoupled_mode=self.env_decoupled_mode,
+                )
+                self._move_rlt_dense_features_to_previous_step(
+                    stage_id,
+                    rollout_result,
                 )
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
@@ -1272,6 +1385,8 @@ class EnvWorker(Worker):
     def evaluate(self, input_channel: Channel, rollout_channel: Channel):
         eval_metrics = defaultdict(list)
         for eval_rollout_epoch in range(self.eval_rollout_epoch):
+            stage_all_done = [False] * self.stage_num
+            early_stop_eval = False
             if not self.cfg.env.eval.auto_reset or eval_rollout_epoch == 0:
                 for stage_id in range(self.stage_num):
                     self.eval_env_list[stage_id].is_start = True
@@ -1328,6 +1443,29 @@ class EnvWorker(Worker):
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
 
+                    stage_all_done[stage_id] = (
+                        not self.env_decoupled_mode
+                        and self._env_all_done(self.eval_env_list[stage_id])
+                    )
+                    if all(stage_all_done) and eval_step < self.n_eval_chunk_steps - 1:
+                        env_batch = env_output.to_dict()
+                        self.send_to(
+                            group_name=self.cfg.rollout.group_name,
+                            channel=rollout_channel,
+                            data=self._build_rollout_input_data(
+                                env_batch,
+                                all_done=True,
+                            ),
+                            mode="eval",
+                            tag="rollout_results",
+                            route_key=stage_id
+                            if not self.env_decoupled_mode
+                            else None,
+                            decoupled_mode=self.env_decoupled_mode,
+                        )
+                        early_stop_eval = True
+                        break
+
                     if self.cfg.env.eval.auto_reset:
                         if (
                             eval_rollout_epoch == self.eval_rollout_epoch - 1
@@ -1347,6 +1485,9 @@ class EnvWorker(Worker):
                         route_key=stage_id if not self.env_decoupled_mode else None,
                         decoupled_mode=self.env_decoupled_mode,
                     )
+
+            if early_stop_eval:
+                break
 
             self.finish_rollout(mode="eval")
         for stage_id in range(self.stage_num):

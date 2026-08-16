@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
+from rlinf.algorithms.rlt.failure_signal import RLTFailureSignal
 from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
 
 
@@ -36,7 +39,18 @@ class RLTMLPPolicy(MLPPolicy):
         ref_num_action_chunks: int | None = None,
         add_q_head: bool = True,
         q_head_type: str = "default",
+        q_head_hidden_dim: int | None = None,
+        q_head_num_blocks: int | None = None,
         fixed_std: float = 0.002,
+        actor_std_type: str = "fixed",
+        use_tanh_logprob_correction: bool | None = None,
+        residual_actor: bool = False,
+        residual_scale: float = 1.0,
+        failure_signal: dict | None = None,
+        actor_activation: str = "tanh",
+        log_std_min: float = -5,
+        log_std_max: float = 2.0,
+        init_learned_std_to_fixed: bool = True,
     ):
         if not add_q_head:
             raise ValueError(
@@ -59,14 +73,23 @@ class RLTMLPPolicy(MLPPolicy):
         actor_obs_dim = z_dim + proprio_dim + flat_action_dim
         critic_obs_dim = z_dim + proprio_dim
 
+        resolved_q_head_type = (
+            "layernorm" if str(q_head_type) == "default" else str(q_head_type)
+        )
+
         super().__init__(
             obs_dim=actor_obs_dim,
             action_dim=flat_action_dim,
             num_action_chunks=1,
             add_value_head=False,
             add_q_head=add_q_head,
-            q_head_type=q_head_type,
+            q_head_type=resolved_q_head_type,
             critic_obs_dim=critic_obs_dim,
+            q_head_hidden_dim=q_head_hidden_dim,
+            q_head_num_blocks=q_head_num_blocks,
+            actor_activation=actor_activation,
+            log_std_min=log_std_min,
+            log_std_max=log_std_max,
         )
         self.z_dim = z_dim
         self.proprio_dim = proprio_dim
@@ -74,9 +97,57 @@ class RLTMLPPolicy(MLPPolicy):
         self.chunk_len = chunk_len
         self.ref_chunk_len = ref_chunk_len
         self.flat_action_dim = flat_action_dim
+        self.actor_std_type = str(actor_std_type)
+        if self.actor_std_type not in {"fixed", "learned"}:
+            raise ValueError(
+                "actor_std_type must be either 'fixed' or 'learned', got "
+                f"{self.actor_std_type!r}."
+            )
         self.fixed_std = float(fixed_std)
-        if self.fixed_std <= 0:
+        if self.actor_std_type == "fixed" and self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
+        if use_tanh_logprob_correction is None:
+            use_tanh_logprob_correction = self.actor_std_type == "learned"
+        self.use_tanh_logprob_correction = bool(use_tanh_logprob_correction)
+        self.init_learned_std_to_fixed = bool(init_learned_std_to_fixed)
+        if self.actor_std_type == "learned" and self.init_learned_std_to_fixed:
+            self._init_learned_std_head()
+        self.residual_actor = bool(residual_actor)
+        self.residual_scale = float(residual_scale)
+        if self.residual_scale < 0:
+            raise ValueError(
+                f"residual_scale must be non-negative, got {self.residual_scale}."
+            )
+        if self.residual_actor:
+            torch.nn.init.zeros_(self.actor_mean.weight)
+            torch.nn.init.zeros_(self.actor_mean.bias)
+        self.rlt_failure_signal = self._build_failure_signal(failure_signal)
+
+    def _build_failure_signal(self, cfg: dict | None) -> RLTFailureSignal | None:
+        if cfg is None or not bool(cfg.get("enable", False)):
+            return None
+        return RLTFailureSignal(
+            self.z_dim,
+            hidden_dim=int(cfg.get("hidden_dim", 128)),
+            max_centers=int(cfg.get("max_centers", 256)),
+            score_threshold=float(cfg.get("score_threshold", 0.7)),
+            distance_threshold=float(cfg.get("distance_threshold", 6.0)),
+            pre_window=int(cfg.get("pre_window", 2)),
+            post_window=int(cfg.get("post_window", 1)),
+            seed=int(cfg.get("seed", 0)),
+        )
+
+    def _init_learned_std_head(self) -> None:
+        target_logstd = min(
+            max(math.log(max(self.fixed_std, 1e-8)), self.logstd_range[0]),
+            self.logstd_range[1],
+        )
+        normalized = 2 * (target_logstd - self.logstd_range[0]) / (
+            self.logstd_range[1] - self.logstd_range[0]
+        ) - 1
+        bias = math.atanh(max(min(normalized, 0.999), -0.999))
+        torch.nn.init.zeros_(self.actor_logstd.weight)
+        torch.nn.init.constant_(self.actor_logstd.bias, bias)
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -124,10 +195,51 @@ class RLTMLPPolicy(MLPPolicy):
         apply_reference_dropout: bool = False,
         reference_dropout_prob: float = 0.0,
     ) -> torch.Tensor:
+        actor_state, _ = self._actor_state_and_ref(
+            obs,
+            apply_reference_dropout=apply_reference_dropout,
+            reference_dropout_prob=reference_dropout_prob,
+        )
+        return actor_state
+
+    def _actor_state_and_ref(
+        self,
+        obs: dict,
+        *,
+        apply_reference_dropout: bool = False,
+        reference_dropout_prob: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         ref_chunk = self._get_ref_chunk(obs)
+        actor_ref_chunk = ref_chunk
         if apply_reference_dropout:
-            ref_chunk = self._maybe_drop_reference(ref_chunk, reference_dropout_prob)
-        return torch.cat([ref_chunk, self._get_z(obs), self._get_proprio(obs)], dim=-1)
+            actor_ref_chunk = self._maybe_drop_reference(
+                ref_chunk, reference_dropout_prob
+            )
+        actor_state = torch.cat(
+            [actor_ref_chunk, self._get_z(obs), self._get_proprio(obs)], dim=-1
+        )
+        return actor_state, ref_chunk
+
+    def _apply_residual_actor(
+        self,
+        residual_action: torch.Tensor,
+        ref_chunk: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.residual_actor:
+            return residual_action
+        return ref_chunk + self.residual_scale * residual_action
+
+    def _actor_std(
+        self, feat: torch.Tensor, action_mean: torch.Tensor
+    ) -> torch.Tensor:
+        if self.actor_std_type == "fixed":
+            return torch.full_like(action_mean, self.fixed_std)
+        action_logstd = self.actor_logstd(feat)
+        action_logstd = torch.tanh(action_logstd)
+        action_logstd = self.logstd_range[0] + 0.5 * (
+            self.logstd_range[1] - self.logstd_range[0]
+        ) * (action_logstd + 1)
+        return torch.exp(action_logstd)
 
     def _critic_state(self, obs: dict) -> torch.Tensor:
         return torch.cat([self._get_z(obs), self._get_proprio(obs)], dim=-1)
@@ -143,18 +255,23 @@ class RLTMLPPolicy(MLPPolicy):
         deterministic: bool = False,
         **kwargs,
     ):
-        actor_state = self._actor_state(
+        actor_state, ref_chunk = self._actor_state_and_ref(
             obs,
             apply_reference_dropout=apply_reference_dropout,
             reference_dropout_prob=reference_dropout_prob,
         )
         feat = self.backbone(actor_state)
         action_mean = self.actor_mean(feat)
-        action_std = torch.full_like(action_mean, self.fixed_std)
+        action_std = self._actor_std(feat, action_mean)
         probs = Normal(action_mean, action_std)
-        action = action_mean if deterministic else probs.rsample()
-        chunk_logprobs = probs.log_prob(action)
-        action = torch.tanh(action)
+        raw_action = action_mean if deterministic else probs.rsample()
+        chunk_logprobs = probs.log_prob(raw_action)
+        squashed_action = torch.tanh(raw_action)
+        if self.use_tanh_logprob_correction:
+            chunk_logprobs = chunk_logprobs - torch.log(
+                1 - squashed_action.pow(2) + 1e-6
+            )
+        action = self._apply_residual_actor(squashed_action, ref_chunk)
         return action, chunk_logprobs, None
 
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
@@ -199,8 +316,11 @@ class RLTMLPPolicy(MLPPolicy):
         target_actions = self._flatten_batch(
             data["action"] if "action" in data else data["actions"]
         )
-        actor_state = self._actor_state(obs)
+        actor_state, ref_chunk = self._actor_state_and_ref(obs)
         pred_actions = self.actor_mean(self.backbone(actor_state))
+        if self.residual_actor:
+            pred_actions = torch.tanh(pred_actions)
+        pred_actions = self._apply_residual_actor(pred_actions, ref_chunk)
         return F.mse_loss(pred_actions, target_actions, reduction="none")
 
     @torch.inference_mode()
@@ -230,3 +350,10 @@ class RLTMLPPolicy(MLPPolicy):
             "forward_inputs": forward_inputs,
         }
         return chunk_actions, result
+
+    @torch.inference_mode()
+    def predict_failure_signal_gate(self, env_obs: dict) -> dict[str, torch.Tensor] | None:
+        if self.rlt_failure_signal is None:
+            return None
+        obs = self.preprocess_env_obs(env_obs=env_obs)
+        return self.rlt_failure_signal.predict(obs["z_rl"])

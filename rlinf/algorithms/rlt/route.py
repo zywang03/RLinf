@@ -147,12 +147,38 @@ class RealworldRLTRoute(RLTRoute):
 class SimulatorRLTRoute(RLTRoute):
     """Actor/ref/expert routing for ManiSkill RLT with schedule warmup."""
 
-    def __init__(self, *, use_schedule: bool, warmup_updates: int):
+    def __init__(
+        self,
+        *,
+        use_schedule: bool,
+        warmup_updates: int,
+        record_base_warmup: bool = False,
+        record_all_transitions: bool = False,
+        prog_explore_steps: int = 0,
+    ):
         self.use_schedule = use_schedule
         self.warmup_updates = warmup_updates
+        self.record_base_warmup = record_base_warmup
+        self.record_all_transitions = record_all_transitions
+        self.prog_explore_steps = prog_explore_steps
 
     def _ready_for_online(self, version: int) -> bool:
         return not self.use_schedule or int(version) >= self.warmup_updates
+
+    def _progressive_explore_mask(
+        self,
+        actor_switch: torch.Tensor,
+        *,
+        version: int,
+        mode: Literal["train", "eval"],
+    ) -> tuple[torch.Tensor, float]:
+        if mode != "train" or self.prog_explore_steps <= 0:
+            return actor_switch, 1.0
+        ratio = min(max(float(version) / float(self.prog_explore_steps), 0.0), 1.0)
+        if ratio >= 1.0:
+            return actor_switch, ratio
+        explore_mask = torch.rand(actor_switch.shape, device=actor_switch.device) < ratio
+        return actor_switch & explore_mask, ratio
 
     def route(self, ctx: RLTRouteContext) -> RLTRouteOutput:
         actions = ctx.student_actions
@@ -174,6 +200,11 @@ class SimulatorRLTRoute(RLTRoute):
                 dtype=torch.bool,
                 device=actions.device,
             )
+        actor_switch, prog_explore_ratio = self._progressive_explore_mask(
+            actor_switch,
+            version=ctx.version,
+            mode=ctx.mode,
+        )
 
         requested_expert_takeover = _last_info_bool(
             ctx.intervene_requested,
@@ -229,9 +260,20 @@ class SimulatorRLTRoute(RLTRoute):
 
         forward_inputs = result["forward_inputs"]
         forward_inputs["action"] = _flatten_action_chunk(routed_actions).detach()
-        forward_inputs["record_transition"] = critical_phase[:, None]
+        record_transition = critical_phase
+        if self.record_all_transitions:
+            record_transition = torch.ones_like(record_transition, dtype=torch.bool)
+        if self.record_base_warmup and self.use_schedule and not ready_for_online:
+            record_transition = torch.ones_like(record_transition, dtype=torch.bool)
+        forward_inputs["record_transition"] = record_transition[:, None]
         forward_inputs["actor_switch"] = (actor_switch & ~expert_takeover)[:, None]
         forward_inputs["intervention_requested"] = requested_expert_takeover[:, None]
+        forward_inputs["prog_explore_ratio"] = torch.full(
+            (batch_size, 1),
+            prog_explore_ratio,
+            dtype=torch.float32,
+            device=actions.device,
+        )
         result["intervene_flags"] = intervene_flags
         return RLTRouteOutput(actions=routed_actions, result=result)
 
@@ -242,5 +284,8 @@ def build_rlt_route(cfg: Any) -> RLTRoute:
         return SimulatorRLTRoute(
             use_schedule=bool(schedule_cfg.get("enable", False)),
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
+            record_base_warmup=bool(schedule_cfg.get("record_base_warmup", False)),
+            record_all_transitions=bool(schedule_cfg.get("record_all_transitions", False)),
+            prog_explore_steps=int(schedule_cfg.get("prog_explore_steps", 0)),
         )
     return RealworldRLTRoute()

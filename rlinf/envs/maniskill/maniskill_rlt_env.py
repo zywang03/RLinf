@@ -194,6 +194,17 @@ class ManiskillRLTEnv(ManiskillEnv):
                 start_active,
                 dtype=torch.bool,
             ),
+            "near_hole_once": torch.full(
+                (batch_size,),
+                start_active,
+                dtype=torch.bool,
+            ),
+            "near_hole_without_grasp_once": torch.zeros(batch_size, dtype=torch.bool),
+            "near_hole_and_grasp_once": torch.full(
+                (batch_size,),
+                start_active,
+                dtype=torch.bool,
+            ),
             "actor_switch_step": torch.zeros(batch_size, dtype=torch.float32),
             "expert_takeover_active": torch.zeros(batch_size, dtype=torch.bool),
             "expert_progress_guard": torch.zeros(batch_size, dtype=torch.bool),
@@ -241,7 +252,17 @@ class ManiskillRLTEnv(ManiskillEnv):
         elif (
             task_mode == self._RLT_FULL_TASK and trigger_mode == self._RLT_AUTO_TRIGGER
         ):
-            enter_actor = self._rlt_auto_enter_actor(infos, device)
+            auto_gate = self._rlt_auto_gate_components(infos, device)
+            enter_actor = auto_gate["enter_actor"]
+            state["near_hole_once"] = state["near_hole_once"] | auto_gate["near_hole"]
+            state["near_hole_without_grasp_once"] = (
+                state["near_hole_without_grasp_once"]
+                | (auto_gate["near_hole"] & (~auto_gate["grasp"]))
+            )
+            state["near_hole_and_grasp_once"] = (
+                state["near_hole_and_grasp_once"]
+                | (auto_gate["near_hole"] & auto_gate["grasp"])
+            )
         else:
             raise ValueError(
                 "rlt_policy_switch supports task_mode in "
@@ -297,6 +318,11 @@ class ManiskillRLTEnv(ManiskillEnv):
             "rlt_switch_flags": rlt_switch_flags[:, None],
             "intervene_flag": intervene_flag[:, None],
             "entered_actor_phase_once": state["entered_actor_phase_once"][:, None],
+            "near_hole_once": state["near_hole_once"][:, None],
+            "near_hole_without_grasp_once": state[
+                "near_hole_without_grasp_once"
+            ][:, None],
+            "near_hole_and_grasp_once": state["near_hole_and_grasp_once"][:, None],
             "actor_switch_step": state["actor_switch_step"][:, None],
             "actor_switch_step_nonzero": torch.where(
                 state["entered_actor_phase_once"],
@@ -636,11 +662,11 @@ class ManiskillRLTEnv(ManiskillEnv):
             "using the aligned peg-insertion info path."
         )
 
-    def _rlt_auto_enter_actor(
+    def _rlt_auto_gate_components(
         self,
         infos: dict[str, Any],
         device: torch.device,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         auto_gate = self._rlt_switch_cfg.get("auto_gate", {})
         grasp = self._rlt_info_bool(infos, "consecutive_grasp_current", device)
         success = self._rlt_info_bool(infos, "success_current", device)
@@ -662,7 +688,19 @@ class ManiskillRLTEnv(ManiskillEnv):
             enter_actor = enter_actor & grasp
         if bool(auto_gate.get("require_not_success", True)):
             enter_actor = enter_actor & (~success)
-        return enter_actor
+        return {
+            "enter_actor": enter_actor,
+            "near_hole": near_hole,
+            "grasp": grasp,
+            "success": success,
+        }
+
+    def _rlt_auto_enter_actor(
+        self,
+        infos: dict[str, Any],
+        device: torch.device,
+    ) -> torch.Tensor:
+        return self._rlt_auto_gate_components(infos, device)["enter_actor"]
 
     def _resolve_rlt_hole_radii(
         self,
@@ -717,6 +755,12 @@ class ManiskillRLTEnv(ManiskillEnv):
 
         self._persistent_done_mask[env_idx] = False
 
+    @property
+    def all_done(self) -> bool:
+        if self.auto_reset or not hasattr(self, "_persistent_done_mask"):
+            return False
+        return bool(self._persistent_done_mask.all().item())
+
     def _update_persistent_done_state(self, dones, extracted_obs, infos):
         if self.auto_reset or not dones.any():
             return
@@ -767,7 +811,13 @@ class ManiskillRLTEnv(ManiskillEnv):
         if not self.record_metrics or "episode" not in infos:
             return infos
         for key in (
+            "consecutive_grasp_once",
+            "prealign_once",
+            "partial_insert_once",
             "entered_actor_phase_once",
+            "near_hole_once",
+            "near_hole_without_grasp_once",
+            "near_hole_and_grasp_once",
             "actor_switch_step",
             "actor_switch_step_nonzero",
         ):
@@ -790,6 +840,9 @@ class ManiskillRLTEnv(ManiskillEnv):
             infos[key] = switch_info[key]
         for key in (
             "entered_actor_phase_once",
+            "near_hole_once",
+            "near_hole_without_grasp_once",
+            "near_hole_and_grasp_once",
             "actor_switch_step",
             "actor_switch_step_nonzero",
         ):
@@ -1007,6 +1060,9 @@ class ManiskillRLTEnv(ManiskillEnv):
             infos_last[key] = switch_info[key]
         for key in (
             "entered_actor_phase_once",
+            "near_hole_once",
+            "near_hole_without_grasp_once",
+            "near_hole_and_grasp_once",
             "actor_switch_step",
             "actor_switch_step_nonzero",
         ):
@@ -1063,6 +1119,9 @@ class ManiskillRLTEnv(ManiskillEnv):
             return
         for key in (
             "entered_actor_phase_once",
+            "near_hole_once",
+            "near_hole_without_grasp_once",
+            "near_hole_and_grasp_once",
             "actor_switch_step",
             "actor_switch_step_nonzero",
         ):

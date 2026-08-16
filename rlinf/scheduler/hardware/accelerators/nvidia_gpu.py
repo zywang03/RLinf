@@ -259,6 +259,19 @@ class NvidiaGPUManager(AcceleratorManager):
         # Simulator env vars
         if len(visible_accelerators) > 0:
             env_vars["MUJOCO_EGL_DEVICE_ID"] = str(visible_accelerators[0])
+            # Sapien/ManiSkill RGB rendering enumerates Vulkan devices separately
+            # from CUDA. On the local H20 node, DRI_PRIME with PCI bus ids pins
+            # Vulkan rendering to the same physical GPU as CUDA_VISIBLE_DEVICES.
+            # Leave caller-provided DRI_PRIME untouched so cluster-specific
+            # settings can override this narrow local mapping.
+            if "DRI_PRIME" not in os.environ:
+                dri_prime_by_gpu = {
+                    "6": "pci-0000_ca_00_0",
+                    "7": "pci-0000_da_00_0",
+                }
+                dri_prime = dri_prime_by_gpu.get(str(visible_accelerators[0]))
+                if dri_prime is not None:
+                    env_vars["DRI_PRIME"] = dri_prime
 
         # NCCL env vars
         env_vars["NCCL_CUMEM_ENABLE"] = "0"

@@ -1,0 +1,116 @@
+defaults:
+  - env/maniskill_rlt@env.eval
+  - model/pi0_5@rollout.model
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: 6-6
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "maniskill_rlt_stage1_openpi_pi05_eval"
+    logger_backends: []
+
+  max_epochs: 1
+  max_steps: -1
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    seed: 2026
+    auto_reset: False
+    ignore_terminations: False
+    use_fixed_reset_state_ids: True
+    max_episode_steps: 100
+    max_steps_per_rollout_epoch: 100
+    policy_mode: eval
+    group_size: 1
+    wrap_obs_mode: rlt_openpi_joint
+    reward_mode: only_success
+    rlt_policy_switch:
+      enable: False
+      expert_takeover:
+        enable: False
+    video_cfg:
+      save_video: False
+      fps: 10
+      record_every: 1
+      video_base_dir: ${runner.logger.log_path}/video/eval
+    init_params:
+      id: "PegInsertionSideWideClearance-v1"
+      obs_mode: "rgb"
+      control_mode: "pd_joint_delta_pos"
+      reward_mode: "sparse"
+      sim_backend: "gpu"
+      max_episode_steps: ${env.eval.max_episode_steps}
+      sim_config:
+        sim_freq: 100
+        control_freq: 10
+      sensor_configs:
+        width: 384
+        height: 384
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: False
+  pipeline_stage_num: 1
+  collect_transitions: False
+  collect_prev_infos: False
+  enable_torch_compile: False
+  enable_cuda_graph: False
+
+  model:
+    model_path: "/data/RLinf/logs/stage1_pi05_2gpu_20260731_063159/maniskill_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_250"
+    model_type: "openpi"
+    precision: null
+    policy_setup: "panda-qpos"
+    num_action_chunks: 10
+    action_dim: 8
+    add_value_head: False
+    num_steps: 5
+    openpi_data:
+      repo_id: "maniskill_peginsertionside_joint"
+      default_prompt: "insert the peg in the hole"
+      norm_stats_path: "/data/datasets/lerobot/maniskill_peginsertionside_joint/norm_stats.json"
+    openpi:
+      config_name: "pi05_rlt_maniskill_joint"
+      num_images_in_input: 2
+      train_expert_only: False
+      detach_critic_input: True
+      action_horizon: 10
+      action_chunk: ${rollout.model.num_action_chunks}
+      action_env_dim: ${rollout.model.action_dim}
+      num_steps: ${rollout.model.num_steps}
+      use_rlt: True
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      rlt_num_rl_tokens: 1
+      rlt_prefix_seq_len: 1024
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_encoder_type: "append_self_attention"
+      rlt_image_only: False
+      rlt_use_mask: True

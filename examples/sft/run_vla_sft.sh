@@ -11,6 +11,8 @@ export PYTHONPATH=${REPO_PATH}:${LIBERO_REPO_PATH}:$PYTHONPATH
 
 export DREAMZERO_PATH=${DREAMZERO_PATH:-"/path/to/DreamZero"}
 export PYTHONPATH=${DREAMZERO_PATH}:$PYTHONPATH
+export WANDB_MODE="${WANDB_MODE:-online}"
+LOGGER_BACKENDS="${LOGGER_BACKENDS:-[\"wandb\"]}"
 
 if [ -z "$1" ]; then
     CONFIG_NAME="maniskill_ppo_openvlaoft"
@@ -22,6 +24,6 @@ echo "Using Python at $(which python)"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
 MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
 mkdir -p "${LOG_DIR}"
-CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
+CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR} runner.logger.logger_backends=${LOGGER_BACKENDS}"
 echo ${CMD} > ${MEGA_LOG_FILE}
 ${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}

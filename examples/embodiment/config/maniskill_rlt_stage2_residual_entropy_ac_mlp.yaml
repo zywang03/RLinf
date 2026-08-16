@@ -1,0 +1,27 @@
+defaults:
+  - maniskill_rlt_stage2_residual_ac_mlp
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "maniskill_rlt_stage2_residual_entropy_ac_mlp"
+
+algorithm:
+  backup_entropy: True
+  entropy_tuning:
+    enable: True
+    alpha_type: softplus
+    initial_alpha: 0.01
+    # Entropy target in nats over the full 8x10 flattened action chunk.
+    # -15 corresponds to per-step std ~0.2, which keeps residual exploration
+    # meaningful without letting the learned std explode (the old -80 made
+    # alpha collapse to ~0 and std stay near 0.4+).
+    target_entropy: -15.0
+
+actor:
+  model:
+    actor_std_type: "learned"
+    # Cap the learned std at exp(-1.5) ~= 0.22 so residual rollouts stay
+    # bounded (residual_scale=0.1 => effective residual std ~0.02).
+    log_std_max: -1.5
+    use_tanh_logprob_correction: True

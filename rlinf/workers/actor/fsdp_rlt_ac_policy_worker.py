@@ -13,11 +13,21 @@
 # limitations under the License.
 
 import queue
+import os
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.algorithms.rlt.failure_signal import (
+    RLTFailureSignal,
+    RLTFailureSignalEpisode,
+    RLTFailureSignalTrainer,
+)
+from rlinf.algorithms.rlt.transition import (
+    RLT_OBS_KEYS,
+    use_simulator_transition_replay,
+)
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
@@ -59,6 +69,16 @@ class RLTACLossMixin:
         if not self.use_rlt_schedule:
             return int(self.version)
         return int(self.update_step)
+
+    def _entropy_enabled(self) -> bool:
+        entropy_cfg = self.cfg.algorithm.get("entropy_tuning", {}) or {}
+        return bool(entropy_cfg.get("enable", False))
+
+    def setup_model_and_optimizer(self, *args, **kwargs):
+        super().setup_model_and_optimizer(*args, **kwargs)
+        if not self._entropy_enabled():
+            self.alpha_optimizer = None
+            self.alpha_lr_scheduler = None
 
     def _ref_chunk(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
         chunk_len, action_dim = self._chunk_shape()
@@ -241,10 +261,13 @@ class RLTACLossMixin:
         )
 
         with torch.no_grad():
-            next_actions, _, _ = self.model(
+            next_actions, next_log_pi, _ = self.model(
                 forward_type=ForwardType.SAC,
                 obs=next_obs,
             )
+            if next_log_pi.ndim == 1:
+                next_log_pi = next_log_pi.unsqueeze(-1)
+            next_log_pi = next_log_pi.sum(dim=-1, keepdim=True)
 
             if not use_crossq:
                 all_qf_next_target = self.target_model(
@@ -262,6 +285,13 @@ class RLTACLossMixin:
                     next_actions=next_actions,
                 )
                 q_next = self._min_twin_q(all_qf_next.detach())
+
+            if (
+                self._entropy_enabled()
+                and self.cfg.algorithm.get("backup_entropy", True)
+            ):
+                q_next = q_next - self.entropy_temp.alpha * next_log_pi
+                q_next = q_next.to(dtype=self.torch_dtype)
 
             reward_target = self._discounted_chunk_rewards(rewards)
             reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
@@ -349,14 +379,24 @@ class RLTACLossMixin:
         entropy = -log_pi.mean()
         bc_weight, q_weight, weight_metrics = self._actor_objective_weights()
         actor_loss = -q_weight * qf_pi.mean() + bc_weight * bc_loss
+        if self._entropy_enabled():
+            actor_loss = actor_loss + (self.entropy_temp.alpha * log_pi).mean()
         metrics.update(weight_metrics)
-        metrics["action_ref_abs_mean"] = (
-            (self._flatten_chunk(pi) - self._flatten_chunk(ref_chunk))
-            .abs()
-            .mean()
-            .detach()
-            .item()
+        metrics["entropy_enabled"] = float(self._entropy_enabled())
+        flat_pi = self._flatten_chunk(pi)
+        flat_ref = self._flatten_chunk(ref_chunk)
+        flat_delta = flat_pi - flat_ref
+        metrics["action_abs_mean"] = flat_pi.abs().mean().detach().item()
+        metrics["ref_abs_mean"] = flat_ref.abs().mean().detach().item()
+        metrics["action_ref_abs_mean"] = flat_delta.abs().mean().detach().item()
+        metrics["action_ref_abs_max"] = flat_delta.abs().max().detach().item()
+        residual_scale = float(
+            self.cfg.actor.model.get("residual_scale", 1.0)
         )
+        if residual_scale > 0:
+            metrics["raw_residual_abs_mean"] = (
+                flat_delta.abs().mean().detach().item() / residual_scale
+            )
         metrics["weighted_q"] = (q_weight * qf_pi.mean()).detach().item()
         metrics["weighted_bc"] = (bc_weight * bc_loss).detach().item()
         metrics["reference_dropout_prob"] = reference_dropout_prob
@@ -365,15 +405,363 @@ class RLTACLossMixin:
 
     @Worker.timer("forward_alpha")
     def forward_alpha(self, batch):
-        del batch
-        raise NotImplementedError(
-            "RLT AC disables entropy/alpha training. Use "
-            "algorithm.entropy_tuning.alpha_type=fixed_alpha."
-        )
+        curr_obs = batch["curr_obs"]
+        with torch.no_grad():
+            _, log_pi, _ = self.model(
+                forward_type=ForwardType.SAC,
+                obs=curr_obs,
+            )
+            if log_pi.ndim == 1:
+                log_pi = log_pi.unsqueeze(-1)
+            log_pi = log_pi.sum(dim=-1, keepdim=True)
+
+        alpha = self.entropy_temp.compute_alpha()
+        return -alpha * (log_pi.mean() + self.target_entropy)
 
 
 class RLTACReplayMixin:
     """Shared rollout-to-replay ingestion for sync and async RLT AC workers."""
+
+    def setup_sac_components(self):
+        super().setup_sac_components()
+        self._init_rlt_failure_signal_trainer()
+
+    def _failure_signal_cfg(self) -> Any:
+        return self.cfg.algorithm.get("rlt_failure_signal", {}) or {}
+
+    def _failure_signal_enabled(self) -> bool:
+        return bool(self._failure_signal_cfg().get("enable", False))
+
+    def _failure_signal_warmup_once(self) -> bool:
+        return (
+            str(self._failure_signal_cfg().get("train_mode", "warmup_once"))
+            == "warmup_once"
+        )
+
+    def _unwrap_rlt_policy_model(self):
+        model = self.model
+        for attr in ("module", "_fsdp_wrapped_module"):
+            wrapped = getattr(model, attr, None)
+            if wrapped is not None:
+                model = wrapped
+        return model
+
+    def _rlt_failure_signal_module(self) -> RLTFailureSignal | None:
+        module = getattr(self._unwrap_rlt_policy_model(), "rlt_failure_signal", None)
+        return module if isinstance(module, RLTFailureSignal) else None
+
+    def _init_rlt_failure_signal_trainer(self) -> None:
+        self.rlt_failure_signal_trainer = None
+        self._last_failure_signal_metrics = {}
+        if not self._failure_signal_enabled():
+            return
+        module = self._rlt_failure_signal_module()
+        if module is None:
+            raise ValueError(
+                "algorithm.rlt_failure_signal.enable=True requires "
+                "actor.model.failure_signal.enable=True on the RLT policy."
+            )
+        self.rlt_failure_signal_trainer = RLTFailureSignalTrainer(
+            module,
+            self._failure_signal_cfg(),
+            device=torch.device(self.device),
+        )
+
+    def save_checkpoint(self, save_base_path: str, step: int) -> None:
+        super().save_checkpoint(save_base_path, step)
+        if not getattr(self, "use_rlt_schedule", False):
+            return
+
+        trainer = getattr(self, "rlt_failure_signal_trainer", None)
+        state = {
+            "update_step": int(self.update_step),
+            "transitions_since_train": int(
+                getattr(self, "transitions_since_train", 0)
+            ),
+            "episodes_since_train": int(getattr(self, "episodes_since_train", 0)),
+            "total_transitions_added": int(
+                getattr(self, "total_transitions_added", 0)
+            ),
+            "total_episodes_added": int(getattr(self, "total_episodes_added", 0)),
+            "warmup_ready_total_transitions": getattr(
+                self, "_warmup_ready_total_transitions", None
+            ),
+            "warmup_ready_total_episodes": getattr(
+                self, "_warmup_ready_total_episodes", None
+            ),
+            "pending_update_budget": int(getattr(self, "pending_update_budget", 0)),
+        }
+        if trainer is not None:
+            state["failure_signal_trainer"] = trainer.state_dict()
+        torch.save(state, os.path.join(save_base_path, "rlt_state.pt"))
+
+    def load_checkpoint(self, load_base_path: str) -> None:
+        super().load_checkpoint(load_base_path)
+        if not getattr(self, "use_rlt_schedule", False):
+            return
+
+        state_path = os.path.join(load_base_path, "rlt_state.pt")
+        if not os.path.exists(state_path):
+            return
+        state = torch.load(state_path, map_location="cpu", weights_only=False)
+        self.update_step = int(state["update_step"])
+        self.transitions_since_train = int(
+            state.get("transitions_since_train", 0)
+        )
+        self.episodes_since_train = int(state.get("episodes_since_train", 0))
+        self.total_transitions_added = int(
+            state.get("total_transitions_added", 0)
+        )
+        self.total_episodes_added = int(state.get("total_episodes_added", 0))
+        self._warmup_ready_total_transitions = state.get(
+            "warmup_ready_total_transitions", None
+        )
+        self._warmup_ready_total_episodes = state.get(
+            "warmup_ready_total_episodes", None
+        )
+        self.pending_update_budget = int(state.get("pending_update_budget", 0))
+
+        trainer = getattr(self, "rlt_failure_signal_trainer", None)
+        trainer_state = state.get("failure_signal_trainer", None)
+        if trainer is not None and isinstance(trainer_state, dict):
+            trainer.load_state_dict(trainer_state)
+
+    def _extract_failure_signal_episodes(
+        self,
+        recv_list: list[Trajectory],
+    ) -> list[RLTFailureSignalEpisode]:
+        episodes = []
+        reward_threshold = float(
+            self._failure_signal_cfg().get("success_reward_threshold", 0.0)
+        )
+        for trajectory in recv_list:
+            assert isinstance(trajectory, Trajectory)
+            forward_inputs = trajectory.forward_inputs
+            if not isinstance(forward_inputs, dict) or "z_rl" not in forward_inputs:
+                continue
+            z_rl = forward_inputs["z_rl"]
+            rewards = trajectory.rewards
+            dones = trajectory.dones
+            if (
+                not isinstance(z_rl, torch.Tensor)
+                or not isinstance(rewards, torch.Tensor)
+                or not isinstance(dones, torch.Tensor)
+            ):
+                continue
+            if z_rl.dim() < 3 or rewards.dim() < 2 or dones.dim() < 2:
+                continue
+            traj_len = min(int(z_rl.shape[0]), int(rewards.shape[0]))
+            batch_size = int(z_rl.shape[1])
+            done_steps = dones
+            if int(done_steps.shape[0]) == traj_len + 1:
+                done_steps = done_steps[1:]
+            else:
+                done_steps = done_steps[:traj_len]
+            done_steps = done_steps.reshape(
+                done_steps.shape[0],
+                done_steps.shape[1],
+                -1,
+            )
+            reward_steps = rewards[:traj_len].reshape(
+                traj_len,
+                rewards.shape[1],
+                -1,
+            )
+            dense_z_rl = forward_inputs.get("rlt_dense_z_rl", None)
+            dense_offsets = forward_inputs.get("rlt_dense_offsets", None)
+            if (
+                isinstance(dense_z_rl, torch.Tensor)
+                and isinstance(dense_offsets, torch.Tensor)
+                and dense_z_rl.dim() >= 4
+                and dense_offsets.dim() >= 3
+            ):
+                episodes.extend(
+                    self._extract_dense_failure_signal_episodes(
+                        z_rl=z_rl[:traj_len],
+                        dense_z_rl=dense_z_rl[:traj_len],
+                        dense_offsets=dense_offsets[:traj_len],
+                        reward_steps=reward_steps,
+                        done_steps=done_steps[:traj_len],
+                        reward_threshold=reward_threshold,
+                    )
+                )
+                continue
+            for env_idx in range(batch_size):
+                env_done = done_steps[:, env_idx].to(torch.bool).any(dim=-1)
+                done_indices = torch.nonzero(env_done, as_tuple=False).reshape(-1)
+                if done_indices.numel() == 0:
+                    continue
+                start = 0
+                for done_idx in done_indices.tolist():
+                    end = int(done_idx) + 1
+                    if end <= start:
+                        continue
+                    env_rewards = reward_steps[start:end, env_idx].detach().float()
+                    success = bool((env_rewards > reward_threshold).any().item())
+                    episodes.append(
+                        RLTFailureSignalEpisode(
+                            z_rl=z_rl[start:end, env_idx].detach().float().cpu(),
+                            failed=not success,
+                        )
+                    )
+                    start = end
+        return episodes
+
+    def _extract_dense_failure_signal_episodes(
+        self,
+        *,
+        z_rl: torch.Tensor,
+        dense_z_rl: torch.Tensor,
+        dense_offsets: torch.Tensor,
+        reward_steps: torch.Tensor,
+        done_steps: torch.Tensor,
+        reward_threshold: float,
+    ) -> list[RLTFailureSignalEpisode]:
+        episodes = []
+        traj_len = min(
+            int(z_rl.shape[0]),
+            int(dense_z_rl.shape[0]),
+            int(dense_offsets.shape[0]),
+            int(reward_steps.shape[0]),
+            int(done_steps.shape[0]),
+        )
+        batch_size = int(z_rl.shape[1])
+        for env_idx in range(batch_size):
+            episode_z = []
+            episode_success = False
+            for step_idx in range(traj_len):
+                env_done = (
+                    done_steps[step_idx, env_idx].reshape(-1).to(torch.bool).cpu()
+                )
+                env_rewards = (
+                    reward_steps[step_idx, env_idx].reshape(-1).detach().float().cpu()
+                )
+                done_indices = torch.nonzero(env_done, as_tuple=False).reshape(-1)
+                done_offset = (
+                    int(done_indices[0].item()) + 1
+                    if done_indices.numel() > 0
+                    else None
+                )
+                reward_end = (
+                    done_offset if done_offset is not None else env_rewards.numel()
+                )
+                if reward_end > 0 and bool(
+                    (env_rewards[:reward_end] > reward_threshold).any().item()
+                ):
+                    episode_success = True
+
+                offsets = dense_offsets[step_idx, env_idx].reshape(-1).detach().cpu()
+                dense_values = dense_z_rl[step_idx, env_idx]
+                valid_offsets = []
+                for dense_idx, offset in enumerate(offsets.tolist()):
+                    offset = int(offset)
+                    if offset < 1:
+                        continue
+                    if done_offset is not None and offset > done_offset:
+                        continue
+                    if dense_idx >= dense_values.shape[0]:
+                        continue
+                    valid_offsets.append(offset)
+                    episode_z.append(
+                        dense_values[dense_idx].detach().float().cpu()
+                    )
+                if not valid_offsets:
+                    episode_z.append(z_rl[step_idx, env_idx].detach().float().cpu())
+                else:
+                    chunk_end = done_offset if done_offset is not None else env_rewards.numel()
+                    if max(valid_offsets) < chunk_end:
+                        episode_z.append(
+                            z_rl[step_idx, env_idx].detach().float().cpu()
+                        )
+
+                if done_offset is None:
+                    continue
+                if episode_z:
+                    episodes.append(
+                        RLTFailureSignalEpisode(
+                            z_rl=torch.stack(episode_z, dim=0),
+                            failed=not episode_success,
+                        )
+                    )
+                episode_z = []
+                episode_success = False
+        return episodes
+
+    def _maybe_train_rlt_failure_signal(
+        self,
+        recv_list: list[Trajectory],
+    ) -> None:
+        trainer = getattr(self, "rlt_failure_signal_trainer", None)
+        if trainer is None:
+            return
+        if self._failure_signal_warmup_once() and trainer.trained_once:
+            self._last_failure_signal_metrics = {
+                "failure_signal/new_episodes": 0.0,
+                "failure_signal/new_failure_episodes": 0.0,
+                "failure_signal/frozen": 1.0,
+                "failure_signal/generation": float(
+                    trainer.module.train_generation.detach().cpu().item()
+                ),
+            }
+            return
+        episodes = self._extract_failure_signal_episodes(recv_list)
+        new_failures = trainer.add_episodes(episodes)
+        metrics = {
+            "failure_signal/new_episodes": float(len(episodes)),
+            "failure_signal/new_failure_episodes": float(new_failures),
+        }
+        if new_failures > 0 and not self._failure_signal_warmup_once():
+            metrics.update(trainer.train_to_convergence())
+        else:
+            metrics.update(
+                {
+                    "failure_signal/trained": 0.0,
+                    "failure_signal/episodes": float(len(trainer.episodes)),
+                    "failure_signal/failure_episodes": float(
+                        trainer.failure_episode_count
+                    ),
+                }
+            )
+        self._last_failure_signal_metrics = metrics
+
+    def _failure_signal_warmup_complete(self) -> bool:
+        if not self.use_rlt_schedule:
+            min_buffer_size = int(
+                self.cfg.algorithm.replay_buffer.get("min_buffer_size", 1)
+            )
+            return (
+                self.replay_buffer is not None
+                and self.replay_buffer.total_samples >= min_buffer_size
+            )
+        warmup_min_size = int(
+            self.rlt_schedule_cfg.get(
+                "warmup_min_size",
+                self.cfg.algorithm.replay_buffer.get("min_buffer_size", 1),
+            )
+        )
+        warmup_required_updates = int(
+            self.rlt_schedule_cfg.get("warmup_post_collect_updates", 0)
+        )
+        buffer_ready = False
+        if getattr(self, "_warmup_ready_total_transitions", None) is not None:
+            buffer_ready = True
+        elif self.replay_buffer is not None:
+            buffer_ready = self.replay_buffer.total_samples >= warmup_min_size
+        return buffer_ready and int(self.update_step) >= warmup_required_updates
+
+    def _maybe_train_rlt_failure_signal_after_warmup(self) -> None:
+        trainer = getattr(self, "rlt_failure_signal_trainer", None)
+        if trainer is None or not self._failure_signal_warmup_once():
+            return
+        if trainer.trained_once:
+            return
+        if not self._failure_signal_warmup_complete():
+            return
+        metrics = trainer.train_once()
+        self._last_failure_signal_metrics = {
+            **self._last_failure_signal_metrics,
+            **metrics,
+        }
 
     @staticmethod
     def _trajectory_transition_count(traj: Trajectory) -> int:
@@ -442,6 +830,178 @@ class RLTACReplayMixin:
             return None
         obs = self._row_tensor_dict(value, idx)
         return obs if obs else None
+
+    def _rlt_obs_from_forward_inputs(
+        self,
+        forward_inputs: dict[str, object],
+        step_idx: int,
+        env_idx: int,
+        *,
+        dense_idx: int | None = None,
+    ) -> dict[str, torch.Tensor] | None:
+        obs = {}
+        for key in RLT_OBS_KEYS:
+            source_key = f"rlt_dense_{key}" if dense_idx is not None else key
+            value = forward_inputs.get(source_key)
+            if not isinstance(value, torch.Tensor):
+                return None
+            if step_idx >= value.shape[0] or env_idx >= value.shape[1]:
+                return None
+            if dense_idx is not None:
+                if value.dim() < 4 or dense_idx >= value.shape[2]:
+                    return None
+                row = value[step_idx, env_idx, dense_idx]
+            else:
+                row = value[step_idx, env_idx]
+            obs[key] = (
+                row.detach()
+                .clone()
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .cpu()
+                .contiguous()
+            )
+        return obs
+
+    def _replay_chunk_shape(self) -> tuple[int, int]:
+        model_cfg = self.cfg.actor.model
+        return int(model_cfg.num_action_chunks), int(model_cfg.action_dim)
+
+    def _chunk_window(
+        self,
+        tensor: torch.Tensor | None,
+        step_idx: int,
+        env_idx: int,
+        offset: int,
+        *,
+        dtype: torch.dtype | None = None,
+        pad_value: float | bool | None = None,
+    ) -> torch.Tensor | None:
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        chunk_len, action_dim = self._replay_chunk_shape()
+        pieces = []
+        cursor = step_idx
+        start = offset
+        while len(pieces) < chunk_len and cursor < tensor.shape[0]:
+            if env_idx >= tensor.shape[1]:
+                return None
+            row = tensor[cursor, env_idx].detach()
+            if row.numel() % action_dim == 0 and row.numel() != chunk_len:
+                row = row.reshape(-1, action_dim)
+            else:
+                row = row.reshape(-1)
+            for item in row[start:]:
+                pieces.append(item)
+                if len(pieces) == chunk_len:
+                    break
+            cursor += 1
+            start = 0
+        if not pieces:
+            return None
+        if len(pieces) < chunk_len:
+            if pad_value is None:
+                pieces.extend([pieces[-1].clone()] * (chunk_len - len(pieces)))
+            else:
+                pieces.extend(
+                    [torch.full_like(pieces[-1], pad_value)]
+                    * (chunk_len - len(pieces))
+                )
+        window = torch.stack(pieces[:chunk_len], dim=0)
+        if dtype is not None:
+            window = window.to(dtype=dtype)
+        return window
+
+    def _reward_done_windows(
+        self,
+        trajectory: Trajectory,
+        step_idx: int,
+        env_idx: int,
+        offset: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        rewards = self._chunk_window(
+            trajectory.rewards,
+            step_idx,
+            env_idx,
+            offset,
+            dtype=torch.float32,
+            pad_value=0.0,
+        )
+        dones = self._chunk_window(
+            trajectory.dones,
+            step_idx,
+            env_idx,
+            offset,
+            dtype=torch.bool,
+            pad_value=False,
+        )
+        terminations = self._chunk_window(
+            trajectory.terminations,
+            step_idx,
+            env_idx,
+            offset,
+            dtype=torch.bool,
+            pad_value=False,
+        )
+        truncations = self._chunk_window(
+            trajectory.truncations,
+            step_idx,
+            env_idx,
+            offset,
+            dtype=torch.bool,
+            pad_value=False,
+        )
+        if (
+            rewards is None
+            or dones is None
+            or terminations is None
+            or truncations is None
+        ):
+            return None
+        done_positions = torch.nonzero(dones.reshape(-1), as_tuple=False).reshape(-1)
+        if done_positions.numel() > 0:
+            first_done = int(done_positions[0].item())
+            if first_done + 1 < rewards.shape[0]:
+                rewards[first_done + 1 :] = 0.0
+                dones[first_done + 1 :] = False
+                terminations[first_done + 1 :] = False
+                truncations[first_done + 1 :] = False
+        return rewards, dones, terminations, truncations
+
+    def _action_window(
+        self,
+        actions: torch.Tensor | None,
+        step_idx: int,
+        env_idx: int,
+        offset: int,
+    ) -> torch.Tensor | None:
+        window = self._chunk_window(actions, step_idx, env_idx, offset)
+        if window is None:
+            return None
+        chunk_len, action_dim = self._replay_chunk_shape()
+        return window.reshape(chunk_len, action_dim)
+
+    def _record_transition_at(
+        self,
+        forward_inputs: dict[str, object],
+        step_idx: int,
+        env_idx: int,
+    ) -> bool:
+        record_transition = forward_inputs.get("record_transition")
+        if not isinstance(record_transition, torch.Tensor):
+            return False
+        if (
+            step_idx >= record_transition.shape[0]
+            or env_idx >= record_transition.shape[1]
+        ):
+            return False
+        return bool(
+            record_transition[step_idx, env_idx]
+            .detach()
+            .to(torch.bool)
+            .reshape(-1)
+            .all()
+        )
 
     @staticmethod
     def _flat_record_transition(flat: dict, idx: int) -> bool:
@@ -518,11 +1078,11 @@ class RLTACReplayMixin:
 
                 curr_obs = self._rlt_obs_from_flat_dict(flat, "curr_obs", idx)
                 if curr_obs is None:
-                    raise ValueError(
-                        "RLT transition replay requires curr_obs. Ensure "
-                        "update_rlt_transitions() populated transition obs "
-                        f"before replay ingestion, got row index {idx}."
-                    )
+                    # Bootstrap boundary rows may still carry
+                    # record_transition=True but have no curr_obs of their own
+                    # (for example the final action appended after the rollout
+                    # loop). They are not replayable simulator transitions.
+                    continue
                 transition.curr_obs = curr_obs
 
                 # Dones have one extra initial slot, so transition t reads
@@ -573,6 +1133,125 @@ class RLTACReplayMixin:
 
         return replay_trajectories, completed_episodes
 
+    def _dense_transition_replay_trajectories(
+        self,
+        trajectory: Trajectory,
+    ) -> list[Trajectory]:
+        forward_inputs = trajectory.forward_inputs
+        if not isinstance(forward_inputs, dict):
+            return []
+        dense_offsets = forward_inputs.get("rlt_dense_offsets")
+        if not isinstance(dense_offsets, torch.Tensor):
+            return []
+        if (
+            trajectory.actions is None
+            or trajectory.rewards is None
+            or trajectory.dones is None
+        ):
+            return []
+
+        chunk_len, _ = self._replay_chunk_shape()
+        traj_len = min(int(trajectory.actions.shape[0]), int(dense_offsets.shape[0]))
+        bsz = int(trajectory.actions.shape[1])
+        dense_trajectories = []
+
+        for env_idx in range(bsz):
+            for step_idx in range(traj_len):
+                if not self._record_transition_at(forward_inputs, step_idx, env_idx):
+                    continue
+                offsets = dense_offsets[step_idx, env_idx].reshape(-1).detach().cpu()
+                for dense_idx, offset in enumerate(offsets.tolist()):
+                    offset = int(offset)
+                    if offset <= 0 or offset >= chunk_len:
+                        continue
+                    curr_obs = self._rlt_obs_from_forward_inputs(
+                        forward_inputs,
+                        step_idx,
+                        env_idx,
+                        dense_idx=dense_idx,
+                    )
+                    if curr_obs is None:
+                        continue
+                    actions = self._action_window(
+                        trajectory.actions,
+                        step_idx,
+                        env_idx,
+                        offset,
+                    )
+                    reward_done = self._reward_done_windows(
+                        trajectory,
+                        step_idx,
+                        env_idx,
+                        offset,
+                    )
+                    if actions is None or reward_done is None:
+                        continue
+                    rewards, dones, terminations, truncations = reward_done
+                    is_done = bool(dones.reshape(-1).any().item())
+                    if is_done:
+                        next_obs = curr_obs
+                    else:
+                        next_obs = self._rlt_obs_from_forward_inputs(
+                            forward_inputs,
+                            step_idx + 1,
+                            env_idx,
+                            dense_idx=dense_idx,
+                        )
+                    if next_obs is None:
+                        continue
+
+                    transition = Trajectory(
+                        max_episode_length=1,
+                        model_weights_id=trajectory.model_weights_id,
+                    )
+                    transition.curr_obs = curr_obs
+                    transition.next_obs = next_obs
+                    transition.actions = (
+                        actions.reshape(1, 1, -1).cpu().contiguous()
+                    )
+                    transition.rewards = (
+                        rewards.reshape(1, 1, -1).cpu().contiguous()
+                    )
+                    transition.dones = dones.reshape(1, 1, -1).cpu().contiguous()
+                    transition.terminations = (
+                        terminations.reshape(1, 1, -1).cpu().contiguous()
+                    )
+                    transition.truncations = (
+                        truncations.reshape(1, 1, -1).cpu().contiguous()
+                    )
+                    transition.forward_inputs = {
+                        **curr_obs,
+                        "action": transition.actions.reshape(1, -1),
+                        "record_transition": torch.ones(
+                            (1, 1), dtype=torch.bool
+                        ),
+                    }
+                    versions = getattr(trajectory, "versions", None)
+                    if (
+                        isinstance(versions, torch.Tensor)
+                        and step_idx < versions.shape[0]
+                        and env_idx < versions.shape[1]
+                    ):
+                        transition.versions = self._step_env_tensor(
+                            versions, step_idx, env_idx
+                        )
+                    intervene_flags = self._action_window(
+                        trajectory.intervene_flags,
+                        step_idx,
+                        env_idx,
+                        offset,
+                    )
+                    if intervene_flags is not None:
+                        transition.intervene_flags = (
+                            intervene_flags.reshape(1, 1, -1)
+                            .to(torch.bool)
+                            .cpu()
+                            .contiguous()
+                        )
+                    dense_trajectories.append(transition)
+
+        return dense_trajectories
+
     def _transition_replay_metrics(
         self,
         replay_trajectories: list[Trajectory],
@@ -610,15 +1289,22 @@ class RLTACReplayMixin:
         if use_simulator_transition_replay(self.cfg):
             replay_list = []
             completed = 0
+            dense_count = 0
             for traj in recv_list:
                 assert isinstance(traj, Trajectory)
                 transition_trajs, completed_count = (
                     self._transition_replay_trajectories(traj)
                 )
+                dense_transition_trajs = self._dense_transition_replay_trajectories(
+                    traj
+                )
                 replay_list.extend(transition_trajs)
+                replay_list.extend(dense_transition_trajs)
+                dense_count += len(dense_transition_trajs)
                 completed += completed_count
             self._last_replay_metrics = {
                 **self._transition_replay_metrics(replay_list),
+                "replay/dense_transition_count": float(dense_count),
                 **collect_trajectory_replay_metrics(recv_list, reducer=all_reduce_dict),
             }
             self.replay_buffer.add_trajectories(replay_list)
@@ -699,6 +1385,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
 
+        self._maybe_train_rlt_failure_signal(recv_list)
         added, completed = self._ingest_rollout_trajectories(recv_list)
         self._update_rollout_ingest_counters(added, completed)
 
@@ -820,14 +1507,19 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
             ),
         }
         metrics.update(getattr(self, "_last_replay_metrics", {}))
+        metrics.update(getattr(self, "_last_failure_signal_metrics", {}))
         return updates_to_run, metrics
 
     def run_training(self):
         if not self.use_rlt_schedule:
             mean_metric_dict = super().run_training()
+            self._maybe_train_rlt_failure_signal_after_warmup()
             replay_metrics = getattr(self, "_last_replay_metrics", {})
             if replay_metrics:
                 mean_metric_dict = {**mean_metric_dict, **replay_metrics}
+            failure_signal_metrics = getattr(self, "_last_failure_signal_metrics", {})
+            if failure_signal_metrics:
+                mean_metric_dict = {**mean_metric_dict, **failure_signal_metrics}
             return mean_metric_dict
 
         if self.cfg.actor.get("enable_offload", False):
@@ -836,6 +1528,8 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
 
         updates_to_run, schedule_metrics = self._rlt_updates_to_run()
         if updates_to_run <= 0:
+            self._maybe_train_rlt_failure_signal_after_warmup()
+            schedule_metrics.update(getattr(self, "_last_failure_signal_metrics", {}))
             mean_metric_dict = self.process_train_metrics(schedule_metrics)
             torch.cuda.synchronize()
             torch.distributed.barrier()
@@ -874,6 +1568,8 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         schedule_metrics["rlt/pending_update_budget"] = float(
             self.pending_update_budget
         )
+        self._maybe_train_rlt_failure_signal_after_warmup()
+        schedule_metrics.update(getattr(self, "_last_failure_signal_metrics", {}))
         append_to_dict(metrics, schedule_metrics)
         mean_metric_dict = self.process_train_metrics(metrics)
         self.transitions_since_train = 0
@@ -909,12 +1605,17 @@ class AsyncRLTACFSDPPolicy(
         if not recv_list:
             return
 
+        self._maybe_train_rlt_failure_signal(recv_list)
         added, completed = self._ingest_rollout_trajectories(recv_list)
         self._update_rollout_ingest_counters(added, completed)
 
     async def run_training(self):
         mean_metric_dict = await super().run_training()
+        self._maybe_train_rlt_failure_signal_after_warmup()
         replay_metrics = getattr(self, "_last_replay_metrics", {})
         if replay_metrics:
             mean_metric_dict = {**mean_metric_dict, **replay_metrics}
+        failure_signal_metrics = getattr(self, "_last_failure_signal_metrics", {})
+        if failure_signal_metrics:
+            mean_metric_dict = {**mean_metric_dict, **failure_signal_metrics}
         return mean_metric_dict

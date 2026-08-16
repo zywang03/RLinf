@@ -1,0 +1,12 @@
+defaults:
+  - maniskill_rlt_stage2_ac_mlp
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "maniskill_rlt_stage2_residual_ac_mlp"
+
+actor:
+  model:
+    residual_actor: True
+    residual_scale: 0.1

@@ -19,7 +19,11 @@ import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
-from rlinf.models.embodiment.modules.q_head import MultiCrossQHead, MultiQHead
+from rlinf.models.embodiment.modules.q_head import (
+    MultiCrossQHead,
+    MultiLayerNormQHead,
+    MultiQHead,
+)
 from rlinf.models.embodiment.modules.utils import get_act_func, layer_init
 from rlinf.models.embodiment.modules.value_head import ValueHead
 
@@ -35,6 +39,11 @@ class MLPPolicy(nn.Module, BasePolicy):
         q_head_type="default",
         value_granularity="action_level",
         critic_obs_dim=None,
+        q_head_hidden_dim=None,
+        q_head_num_blocks=None,
+        actor_activation="tanh",
+        log_std_min=-5,
+        log_std_max=2,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -45,7 +54,7 @@ class MLPPolicy(nn.Module, BasePolicy):
         # default setting
         self.independent_std = True
         self.final_tanh = False
-        activation = "tanh"
+        activation = str(actor_activation)
         action_scale = None
 
         self.value_granularity = value_granularity
@@ -65,12 +74,25 @@ class MLPPolicy(nn.Module, BasePolicy):
         if add_q_head:
             self.independent_std = False
             self.final_tanh = True
-            self.logstd_range = (-5, 2)
+            self.logstd_range = (float(log_std_min), float(log_std_max))
             action_scale = -1, 1
             if q_head_type == "default":
                 self.q_head = MultiQHead(
                     hidden_size=self.critic_obs_dim,
                     hidden_dims=[256, 256, 256],
+                    num_q_heads=2,
+                    output_dim=output_dim,
+                    action_feature_dim=action_dim * self.num_action_chunks,
+                )
+            elif q_head_type == "layernorm":
+                self.q_head = MultiLayerNormQHead(
+                    hidden_size=self.critic_obs_dim,
+                    hidden_dim=(
+                        512 if q_head_hidden_dim is None else int(q_head_hidden_dim)
+                    ),
+                    num_blocks=(
+                        2 if q_head_num_blocks is None else int(q_head_num_blocks)
+                    ),
                     num_q_heads=2,
                     output_dim=output_dim,
                     action_feature_dim=action_dim * self.num_action_chunks,

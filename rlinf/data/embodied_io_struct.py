@@ -47,6 +47,43 @@ def get_model_weights_id(versions: torch.Tensor) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, name_bytes.hex()))
 
 
+def _stack_forward_inputs_allow_missing(
+    list_of_dict: list[dict[str, Any]],
+    dim: int = 0,
+) -> dict[str, Any]:
+    if len(list_of_dict) == 0:
+        return {}
+    keys = set()
+    for item in list_of_dict:
+        keys.update(item.keys())
+
+    ret = {}
+    for key in keys:
+        exemplar = next(
+            (item.get(key) for item in list_of_dict if item.get(key) is not None),
+            None,
+        )
+        if exemplar is None:
+            continue
+        if isinstance(exemplar, torch.Tensor):
+            values = [
+                item[key]
+                if key in item and item[key] is not None
+                else torch.zeros_like(exemplar)
+                for item in list_of_dict
+            ]
+            ret[key] = torch.stack(values, dim=dim)
+        elif isinstance(exemplar, dict):
+            values = [
+                item[key] if key in item and item[key] is not None else {}
+                for item in list_of_dict
+            ]
+            ret[key] = _stack_forward_inputs_allow_missing(values, dim=dim)
+        else:
+            raise ValueError(f"{key=}, {type(exemplar)} is not supported!")
+    return ret
+
+
 @dataclass(kw_only=True)
 class EnvOutput:
     """Environment output for a single chunk step."""
@@ -696,7 +733,9 @@ class EmbodiedRolloutResult:
         if len(self.versions) > 0:
             trajectory.versions = torch.stack(self.versions, dim=0).cpu().contiguous()
         if len(self.forward_inputs) > 0:
-            trajectory.forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
+            trajectory.forward_inputs = _stack_forward_inputs_allow_missing(
+                self.forward_inputs
+            )
             for key in trajectory.forward_inputs.keys():
                 trajectory.forward_inputs[key] = (
                     trajectory.forward_inputs[key].cpu().contiguous()

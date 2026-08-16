@@ -19,6 +19,8 @@ export AV_LOG_FORCE_NOCOLOR=1
 export LIBAV_LOG_LEVEL=quiet
 export OPENCV_LOG_LEVEL=off
 export FFREPORT=""
+export WANDB_MODE="${WANDB_MODE:-online}"
+LOGGER_BACKENDS="${LOGGER_BACKENDS:-[\"wandb\"]}"
 
 export PYTHONPATH="${REPO_PATH}:$PYTHONPATH"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -37,7 +39,7 @@ echo "Using Python at $(which python)"
 LOG_DIR="${REPO_PATH}/logs/steam_sft/${CONFIG_NAME}-$(date +'%Y%m%d-%H:%M:%S')"
 LOG_FILE="${LOG_DIR}/run_steam_sft.log"
 mkdir -p "${LOG_DIR}"
-HYDRA_ARGS=("runner.logger.log_path=${LOG_DIR}")
+HYDRA_ARGS=("runner.logger.log_path=${LOG_DIR}" "runner.logger.logger_backends=${LOGGER_BACKENDS}")
 CMD_BASE="python ${SRC_FILE} --config-path ${OFFLINE_RL_CONFIG} --config-name ${CONFIG_NAME}"
 echo "${CMD_BASE} ${HYDRA_ARGS[*]} ${EXTRA_ARGS}" > "${LOG_FILE}"
 ${CMD_BASE} "${HYDRA_ARGS[@]}" ${EXTRA_ARGS} 2>&1 | grep -v "libdav1d" | tee -a "${LOG_FILE}"

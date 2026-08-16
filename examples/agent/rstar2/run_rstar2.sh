@@ -5,6 +5,8 @@ tabs 4
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TOKENIZERS_PARALLELISM=false
 export RAY_DEDUP_LOGS=0
+export WANDB_MODE="${WANDB_MODE:-online}"
+LOGGER_BACKENDS="${LOGGER_BACKENDS:-[\"wandb\"]}"
 
 CONFIG_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_PATH=$(dirname $(dirname $(dirname "$CONFIG_PATH")))
@@ -17,4 +19,4 @@ else
     CONFIG_NAME=$1
 fi
 
-python ${REPO_PATH}/examples/agent/rstar2/main_rstar2.py --config-path ${CONFIG_PATH}/config/  --config-name $CONFIG_NAME
+python ${REPO_PATH}/examples/agent/rstar2/main_rstar2.py --config-path ${CONFIG_PATH}/config/  --config-name $CONFIG_NAME "runner.logger.logger_backends=${LOGGER_BACKENDS}"

@@ -15,7 +15,7 @@
 import copy
 from typing import Any
 
-from omegaconf import open_dict
+from omegaconf import OmegaConf
 
 
 def build_expert_model_config(
@@ -30,8 +30,4 @@ def build_expert_model_config(
         rlt_feature_model_config if rlt_feature_model_config is not None else model_cfg
     )
 
-    with open_dict(expert_model_config):
-        for key, value in expert_cfg.items():
-            expert_model_config[key] = value
-
-    return expert_model_config
+    return OmegaConf.merge(expert_model_config, expert_cfg)

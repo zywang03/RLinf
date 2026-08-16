@@ -33,7 +33,20 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             ),
             add_q_head=cfg.get("add_q_head", True),
             q_head_type=cfg.get("q_head_type", "default"),
+            q_head_hidden_dim=cfg.get("q_head_hidden_dim", None),
+            q_head_num_blocks=cfg.get("q_head_num_blocks", None),
             fixed_std=cfg.get("fixed_std", 0.002),
+            actor_std_type=cfg.get("actor_std_type", "fixed"),
+            use_tanh_logprob_correction=cfg.get(
+                "use_tanh_logprob_correction", None
+            ),
+            residual_actor=cfg.get("residual_actor", False),
+            residual_scale=cfg.get("residual_scale", 1.0),
+            failure_signal=cfg.get("failure_signal", None),
+            actor_activation=cfg.get("actor_activation", "tanh"),
+            log_std_min=cfg.get("log_std_min", -5),
+            log_std_max=cfg.get("log_std_max", 2.0),
+            init_learned_std_to_fixed=cfg.get("init_learned_std_to_fixed", True),
         )
     elif iql_config is not None:
         model = IQLMLPPolicy(

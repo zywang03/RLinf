@@ -14,6 +14,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .batch_renorm import make_batchrenorm
 from .utils import get_act_func, make_mlp
@@ -161,6 +162,94 @@ class MultiQHead(nn.Module):
 
     def q_id_forward(self, q_id, state_features, action_features):
         """Forward pass for Q1 network only"""
+        return self.qs[q_id](state_features, action_features)
+
+
+class LayerNormResidualQBlock(nn.Module):
+    """Residual MLP block with LayerNorm for stable Q-value learning."""
+
+    def __init__(self, hidden_dim: int, expansion: int = 4):
+        super().__init__()
+        self.linear1 = nn.Linear(hidden_dim, hidden_dim * expansion)
+        self.linear2 = nn.Linear(hidden_dim * expansion, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = F.relu(self.linear1(x))
+        x = self.linear2(x)
+        return self.norm(residual + x)
+
+
+class LayerNormQHead(nn.Module):
+    """LayerNorm critic over concatenated state and action features."""
+
+    def __init__(
+        self,
+        hidden_size,
+        action_feature_dim,
+        hidden_dim=512,
+        num_blocks=2,
+        output_dim=1,
+        expansion=4,
+    ):
+        super().__init__()
+        self.embedder = nn.Sequential(
+            nn.Linear(hidden_size + action_feature_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.blocks = nn.Sequential(
+            *[
+                LayerNormResidualQBlock(hidden_dim=hidden_dim, expansion=expansion)
+                for _ in range(num_blocks)
+            ]
+        )
+        self.head_l1 = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.head_l2 = nn.Linear(hidden_dim, output_dim, bias=True)
+
+    def forward(self, state_features, action_features):
+        x = torch.cat([state_features, action_features], dim=-1)
+        x = self.embedder(x)
+        x = self.blocks(x)
+        x = self.head_l1(x)
+        return self.head_l2(x)
+
+
+class MultiLayerNormQHead(nn.Module):
+    """Twin/ensemble LayerNorm critics for SAC-style actor-critic training."""
+
+    def __init__(
+        self,
+        hidden_size,
+        action_feature_dim,
+        hidden_dim=512,
+        num_blocks=2,
+        num_q_heads=2,
+        output_dim=1,
+        expansion=4,
+    ):
+        super().__init__()
+        self.num_q_heads = num_q_heads
+        self.qs = nn.ModuleList(
+            [
+                LayerNormQHead(
+                    hidden_size=hidden_size,
+                    action_feature_dim=action_feature_dim,
+                    hidden_dim=hidden_dim,
+                    num_blocks=num_blocks,
+                    output_dim=output_dim,
+                    expansion=expansion,
+                )
+                for _ in range(num_q_heads)
+            ]
+        )
+
+    def forward(self, state_features, action_features):
+        return torch.cat(
+            [qf(state_features, action_features) for qf in self.qs], dim=-1
+        )
+
+    def q_id_forward(self, q_id, state_features, action_features):
         return self.qs[q_id](state_features, action_features)
 
 
