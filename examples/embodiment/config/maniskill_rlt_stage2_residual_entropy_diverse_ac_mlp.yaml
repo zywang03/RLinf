@@ -1,0 +1,19 @@
+defaults:
+  - maniskill_rlt_stage2_residual_entropy_ac_mlp
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "maniskill_rlt_stage2_residual_entropy_diverse_ac_mlp"
+
+# Slightly higher exploration diversity than the default learned-std variant:
+# std cap relaxed from exp(-2.5)~0.08 to exp(-2.0)~0.135, with the entropy
+# target and initial alpha raised to match. BC/Q weights are unchanged.
+algorithm:
+  entropy_tuning:
+    initial_alpha: 0.003
+    target_entropy: -47.0
+
+actor:
+  model:
+    log_std_max: -2.0
